@@ -1,379 +1,482 @@
 import os
 import re
+import io
+import json
+import time
 import logging
 import datetime
 import requests
+from typing import List, Dict, Optional
 
-from typing import List, Dict, Any, Optional
+# ---------- OpenAI (опціонально для voice) ----------
+try:
+    from openai import OpenAI
+    OPENAI_AVAILABLE = True
+except Exception:
+    OPENAI_AVAILABLE = False
 
+# ---------- Telegram ----------
 from telegram import (
-    Update,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    ReplyKeyboardMarkup,
-    KeyboardButton,
+    Update, InlineKeyboardMarkup, InlineKeyboardButton,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 )
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    ConversationHandler, ContextTypes, filters
 )
 
-# -------------------- ЛОГИ --------------------
 logging.basicConfig(
     format="%(asctime)s %(levelname)s:%(name)s: %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("bot")
 
-# -------------------- ENV --------------------
-BOT_TOKEN       = os.environ["BOT_TOKEN"]
-NOTION_TOKEN    = os.environ["NOTION_TOKEN"]
-CATALOG_DB_ID   = os.environ["CATALOG_DB_ID"]   # ЛИШЕ ID, без https:// і ?v=
-NOTES_DB_ID     = os.environ["NOTES_DB_ID"]     # ЛИШЕ ID
-WEBHOOK_URL     = os.environ.get("WEBHOOK_URL") # https://<your>.up.railway.app
-PORT            = int(os.environ.get("PORT", 8000))
+# ============ ENV ============
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+NOTION_TOKEN = os.environ["NOTION_API_KEY"]
+CATALOG_DB = os.environ["CATALOG_DB_ID"]
+NOTES_DB = os.environ["NOTES_DB_ID"]
 
-NOTION_HEADERS = {
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip()
+PORT = int(os.getenv("PORT", "8080"))
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+# ============ Notion helpers ============
+NOTION_VER = "2022-06-28"
+NHEADERS = {
     "Authorization": f"Bearer {NOTION_TOKEN}",
-    "Notion-Version": "2022-06-28",
+    "Notion-Version": NOTION_VER,
     "Content-Type": "application/json",
 }
 
-NOTION_PAGES     = "https://api.notion.com/v1/pages"
-NOTION_DB_QUERY  = "https://api.notion.com/v1/databases/{db_id}/query"
+def _to_uuid(db: str) -> str:
+    """
+    Приймає або чистий uuid, або URL бази.
+    Повертає uuid у вигляді 8-4-4-4-12.
+    """
+    s = re.sub(r"[^0-9a-fA-F]", "", db)
+    if len(s) < 32:
+        return db  # залишаємо як є, може вже uuid
+    s = s[-32:]
+    return f"{s[0:8]}-{s[8:12]}-{s[12:16]}-{s[16:20]}-{s[20:32]}".lower()
 
-# -------------------- СТАНИ ДІАЛОГІВ --------------------
-(
-    MAIN,
-    ADD_CAT_WAIT_NAME,
-    ADD_SUB_CHOOSE_CAT,
-    ADD_SUB_WAIT_NAME,
-    NOTE_CHOOSE_CAT,
-    NOTE_CHOOSE_SUB,
-    NOTE_WAIT_TEXT,
-    SEARCH_WAIT_QUERY,
-) = range(8)
+CATALOG_DB_ID = _to_uuid(CATALOG_DB)
+NOTES_DB_ID   = _to_uuid(NOTES_DB)
 
-# -------------------- КОНСТАНТИ ТЕКСТІВ --------------------
-BTN_ADD_CAT  = "➕ Категорія"
-BTN_ADD_SUB  = "➕ Підкатегорія"
-BTN_NEW_NOTE = "📝 Нотатка"
-BTN_SEARCH   = "🔎 Пошук"
-BTN_HELP     = "ℹ️ Довідка"
-BTN_CANCEL   = "❌ Скасувати"
-MAIN_KB = ReplyKeyboardMarkup(
-    [[BTN_ADD_CAT, BTN_ADD_SUB],
-     [BTN_NEW_NOTE, BTN_SEARCH],
-     [BTN_HELP, BTN_CANCEL]],
-    resize_keyboard=True
-)
-
-# -------------------- ДОПОМОЖНІ ФУНКЦІЇ NOTION --------------------
-def notion_query(db_id: str, flt: Optional[Dict]=None, sorts: Optional[List]=None, page_size: int=100) -> Dict:
-    payload: Dict[str, Any] = {"page_size": page_size}
-    if flt:   payload["filter"] = flt
-    if sorts: payload["sorts"]  = sorts
-    r = requests.post(NOTION_DB_QUERY.format(db_id=db_id), headers=NOTION_HEADERS, json=payload, timeout=30)
+def notion_query(database_id: str, flt: Optional[dict] = None, page_size: int = 25) -> dict:
+    url = f"https://api.notion.com/v1/databases/{database_id}/query"
+    payload = {"page_size": page_size}
+    if flt:
+        payload["filter"] = flt
+    r = requests.post(url, headers=NHEADERS, data=json.dumps(payload))
     r.raise_for_status()
     return r.json()
 
-def notion_create_page_in_catalog(name: str, type_val: str, parent_id: Optional[str]) -> Dict:
+def notion_create_page(database_id: str, properties: dict) -> dict:
+    url = "https://api.notion.com/v1/pages"
+    payload = {"parent": {"database_id": database_id}, "properties": properties}
+    r = requests.post(url, headers=NHEADERS, data=json.dumps(payload))
+    r.raise_for_status()
+    return r.json()
+
+def notion_find_catalog_by_name(name: str) -> Optional[dict]:
+    """
+    Шукаємо сторінку в Catalog за Title = name.
+    """
+    flt = {
+        "property": "Name",
+        "title": {"equals": name}
+    }
+    try:
+        data = notion_query(CATALOG_DB_ID, flt, page_size=1)
+        if data.get("results"):
+            return data["results"][0]
+    except requests.HTTPError:
+        # fallback на contains (деякі робочі простори інколи мають особливості)
+        flt = {"property": "Name", "title": {"contains": name}}
+        data = notion_query(CATALOG_DB_ID, flt, page_size=1)
+        if data.get("results"):
+            return data["results"][0]
+    return None
+
+def ensure_category(name: str) -> dict:
+    pg = notion_find_catalog_by_name(name)
+    if pg:
+        # перезаписуємо Type=Category якщо інше
+        return pg
+
     props = {
-        "Name": {"title":[{"text":{"content": name}}]},
-        "Type": {"select":{"name": type_val}},
+        "Name": {"title": [{"text": {"content": name}}]},
+        "Type": {"select": {"name": "Category"}},
+        # Parent порожній
     }
-    if parent_id:
-        props["Parent"] = {"relation":[{"id": parent_id}]}
-    payload = {"parent":{"database_id": CATALOG_DB_ID}, "properties": props}
-    r = requests.post(NOTION_PAGES, headers=NOTION_HEADERS, json=payload, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    return notion_create_page(CATALOG_DB_ID, props)
 
-def ensure_category(name: str) -> Dict:
+def ensure_subcategory(cat_id: str, name: str) -> dict:
+    # шукаємо підкатегорію з Parent = cat_id і Name = name
     flt = {
-        "and":[
-            {"property":"Name", "title":{"equals": name}},
-            {"property":"Type", "select":{"equals":"Category"}}
+        "and": [
+            {"property": "Type", "select": {"equals": "Subcategory"}},
+            {"property": "Parent", "relation": {"contains": cat_id}},
+            {"property": "Name", "title": {"equals": name}},
         ]
     }
-    res = notion_query(CATALOG_DB_ID, flt, page_size=1)
-    if res.get("results"):
-        return res["results"][0]
-    return notion_create_page_in_catalog(name, "Category", None)
+    data = notion_query(CATALOG_DB_ID, flt, page_size=1)
+    if data.get("results"):
+        return data["results"][0]
 
-def ensure_subcategory(name: str, parent_id: str) -> Dict:
-    flt = {
-        "and":[
-            {"property":"Name", "title":{"equals": name}},
-            {"property":"Type", "select":{"equals":"Subcategory"}},
-            {"property":"Parent", "relation":{"contains": parent_id}}
-        ]
+    props = {
+        "Name": {"title": [{"text": {"content": name}}]},
+        "Type": {"select": {"name": "Subcategory"}},
+        "Parent": {"relation": [{"id": cat_id}]},
     }
-    res = notion_query(CATALOG_DB_ID, flt, page_size=1)
-    if res.get("results"):
-        return res["results"][0]
-    return notion_create_page_in_catalog(name, "Subcategory", parent_id)
+    return notion_create_page(CATALOG_DB_ID, props)
 
 def list_categories() -> List[Dict]:
-    flt = {"property":"Type","select":{"equals":"Category"}}
-    res = notion_query(CATALOG_DB_ID, flt, page_size=100)
-    items = []
-    for r in res.get("results", []):
-        nm = r["properties"]["Name"]["title"][0]["plain_text"] if r["properties"]["Name"]["title"] else "Без назви"
-        items.append({"id": r["id"], "name": nm})
-    # сортуємо за назвою для красивих кнопок
-    return sorted(items, key=lambda x: x["name"].lower())
+    flt = {"property": "Type", "select": {"equals": "Category"}}
+    data = notion_query(CATALOG_DB_ID, flt, page_size=50)
+    out = []
+    for r in data.get("results", []):
+        name = r["properties"]["Name"]["title"][0]["plain_text"] if r["properties"]["Name"]["title"] else "Без назви"
+        out.append({"id": r["id"], "name": name})
+    return out
 
-def list_subcategories(parent_id: str) -> List[Dict]:
+def list_subcategories(cat_id: str) -> List[Dict]:
     flt = {
-        "and":[
-            {"property":"Type","select":{"equals":"Subcategory"}},
-            {"property":"Parent","relation":{"contains": parent_id}}
+        "and": [
+            {"property": "Type", "select": {"equals": "Subcategory"}},
+            {"property": "Parent", "relation": {"contains": cat_id}},
         ]
     }
-    res = notion_query(CATALOG_DB_ID, flt, page_size=100)
-    items = []
-    for r in res.get("results", []):
-        nm = r["properties"]["Name"]["title"][0]["plain_text"] if r["properties"]["Name"]["title"] else "Без назви"
-        items.append({"id": r["id"], "name": nm})
-    return sorted(items, key=lambda x: x["name"].lower())
+    data = notion_query(CATALOG_DB_ID, flt, page_size=50)
+    out = []
+    for r in data.get("results", []):
+        name = r["properties"]["Name"]["title"][0]["plain_text"] if r["properties"]["Name"]["title"] else "Без назви"
+        out.append({"id": r["id"], "name": name})
+    return out
 
-def notion_create_note(title: str, text: str, tags: List[str], cat_id: Optional[str], sub_id: Optional[str], src_url: Optional[str]) -> Dict:
-    props: Dict[str, Any] = {
-        "Name": {"title":[{"text":{"content": title[:200] or "Note"}}]},
-        "Text": {"rich_text":[{"text":{"content": text or ""}}]},
-        "Created": {"date":{"start": datetime.datetime.now().isoformat()}},
+def notion_create_note(
+    title: str,
+    text: str,
+    tags: List[str],
+    cat_id: str,
+    sub_id: Optional[str],
+    files: Optional[List[dict]],
+    created: datetime.datetime,
+    source_link: str,
+) -> dict:
+    """
+    Створює сторінку в Notes з властивостями:
+      - Name (title)
+      - Text (rich_text)
+      - Tags (multi_select)
+      - Category (relation -> Catalog)
+      - Subcategory (relation -> Catalog)
+      - Created (date)
+      - Source (url)
+      - Files (files) — опційно
+    """
+    tags_norm = [{"name": t.lstrip("#")} for t in tags if t.startswith("#")]
+
+    props = {
+        "Name": {"title": [{"text": {"content": title}}]},
+        "Text": {"rich_text": [{"text": {"content": text}}]} if text else {"rich_text": []},
+        "Tags": {"multi_select": tags_norm},
+        "Category": {"relation": [{"id": cat_id}]},
+        "Created": {"date": {"start": created.isoformat()}},
+        "Source": {"url": source_link or None},
     }
-    if tags:
-        props["Tags"] = {"multi_select":[{"name":t} for t in tags]}
-    if cat_id:
-        props["Category"] = {"relation":[{"id": cat_id}]}
     if sub_id:
-        props["Subcategory"] = {"relation":[{"id": sub_id}]}
-    if src_url:
-        props["Source"] = {"url": src_url}
+        props["Subcategory"] = {"relation": [{"id": sub_id}]}
+    if files:
+        props["Files"] = {"files": files}
 
-    payload = {"parent":{"database_id": NOTES_DB_ID}, "properties": props}
-    r = requests.post(NOTION_PAGES, headers=NOTION_HEADERS, json=payload, timeout=30)
-    r.raise_for_status()
-    return r.json()
+    return notion_create_page(NOTES_DB_ID, props)
 
-# -------------------- УТИЛІТИ ДЛЯ КНОПОК --------------------
-def chunk_buttons(items: List[Dict], prefix: str, per_row: int = 2) -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    row: List[InlineKeyboardButton] = []
-    for it in items:
-        row.append(InlineKeyboardButton(it["name"], callback_data=f"{prefix}:{it['id']}"))
-        if len(row) == per_row:
-            rows.append(row); row = []
-    if row: rows.append(row)
-    rows.append([InlineKeyboardButton("🔙 Назад у меню", callback_data="back:main")])
-    return InlineKeyboardMarkup(rows)
+# ========= Telegram UI =========
+BTN_ADD_CAT = "Категорія"
+BTN_ADD_SUB = "Підкатегорія"
+BTN_NEW_NOTE = "Нотатка"
+BTN_SEARCH  = "Пошук"
+BTN_HELP    = "Довідка"
+BTN_CANCEL  = "Скасувати"
+
+def main_kb() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(BTN_ADD_CAT), KeyboardButton(BTN_ADD_SUB)],
+            [KeyboardButton(BTN_NEW_NOTE), KeyboardButton(BTN_SEARCH)],
+            [KeyboardButton(BTN_HELP), KeyboardButton(BTN_CANCEL)],
+        ],
+        resize_keyboard=True
+    )
+
+MAIN, ADD_CAT_WAIT_NAME, ADD_SUB_CHOOSE_CAT, ADD_SUB_WAIT_NAME, \
+NOTE_CHOOSE_CAT, NOTE_CHOOSE_SUB, NOTE_WAIT_TEXT, SEARCH_WAIT_QUERY = range(8)
+
+def ikb_categories(rows) -> InlineKeyboardMarkup:
+    btns = [[InlineKeyboardButton(r['name'], callback_data=f"CAT:{r['id']}")] for r in rows]
+    btns.append([InlineKeyboardButton("⬅️ Назад у меню", callback_data="BACK:MAIN")])
+    return InlineKeyboardMarkup(btns)
+
+def ikb_subcategories(rows) -> InlineKeyboardMarkup:
+    btns = [[InlineKeyboardButton(r['name'], callback_data=f"SUB:{r['id']}")] for r in rows]
+    btns.append([InlineKeyboardButton("⬅️ Назад у меню", callback_data="BACK:MAIN")])
+    return InlineKeyboardMarkup(btns)
 
 def parse_tags(text: str) -> List[str]:
-    return list({m.lower() for m in re.findall(r"#([A-Za-zА-Яа-я0-9_]+)", text)})
+    return [w for w in text.split() if w.startswith("#")]
 
-# -------------------- ХЕНДЛЕРИ --------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message(
-        "Бот на Railway ✅\n"
-        "Обери дію з меню нижче.",
-        reply_markup=MAIN_KB
-    )
+def src_link(message) -> str:
+    # Можеш додати збереження лінку на повідомлення, якщо є deep-link. Для простоти повертаємо порожньо.
+    return ""
+
+# -------- Voice -> text (опціонально через OpenAI Whisper) --------
+async def transcribe_voice(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Optional[str]:
+    if not OPENAI_AVAILABLE or not OPENAI_API_KEY:
+        return None
+    try:
+        file = await ctx.bot.get_file(update.message.voice.file_id)
+        bio = io.BytesIO()
+        await file.download_to_memory(out=bio)
+        bio.seek(0)
+
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        # сучасна модель для транскрипції:
+        # можна "gpt-4o-mini-transcribe" або "whisper-1" (якщо увімкнена)
+        resp = client.audio.transcriptions.create(
+            model="gpt-4o-mini-transcribe",
+            file=("audio.ogg", bio, "audio/ogg")
+        )
+        text = getattr(resp, "text", None)
+        return text
+    except Exception as e:
+        log.exception(e)
+        return None
+
+# ---------- Handlers ----------
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Бот на Railway ✅\nОбері дію з меню нижче.", reply_markup=main_kb())
     return MAIN
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.effective_chat.send_message("Скасовано. Повертаю в головне меню.", reply_markup=MAIN_KB)
+async def main_menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+
+    if text == BTN_ADD_CAT:
+        await update.message.reply_text("Введи назву категорії:", reply_markup=ReplyKeyboardRemove())
+        return ADD_CAT_WAIT_NAME
+
+    if text == BTN_ADD_SUB:
+        try:
+            cats = list_categories()
+        except Exception as e:
+            log.exception(e)
+            await update.message.reply_text("Помилка читання категорій 😔", reply_markup=main_kb())
+            return MAIN
+        if not cats:
+            await update.message.reply_text("Категорій поки немає. Спочатку додай категорію.", reply_markup=main_kb())
+            return MAIN
+        await update.message.reply_text("Вибери категорію:", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text(" ", reply_markup=ikb_categories(cats))
+        return ADD_SUB_CHOOSE_CAT
+
+    if text == BTN_NEW_NOTE:
+        try:
+            cats = list_categories()
+        except Exception as e:
+            log.exception(e)
+            await update.message.reply_text("Помилка читання категорій 😔", reply_markup=main_kb())
+            return MAIN
+        if not cats:
+            await update.message.reply_text("Категорій поки немає. Спочатку додай категорію.", reply_markup=main_kb())
+            return MAIN
+        await update.message.reply_text("Вибери категорію для нотатки:", reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text(" ", reply_markup=ikb_categories(cats))
+        return NOTE_CHOOSE_CAT
+
+    if text == BTN_SEARCH:
+        await update.message.reply_text("Введи слово або #тег для пошуку:", reply_markup=ReplyKeyboardRemove())
+        return SEARCH_WAIT_QUERY
+
+    if text == BTN_HELP:
+        await update.message.reply_text(
+            "Команди:\n"
+            "• Категорія — створити категорію\n"
+            "• Підкатегорія — створити підкатегорію\n"
+            "• Нотатка — додати нотатку (текст/голос/фото)\n"
+            "• Пошук — знайти в нотатках\n"
+            "Підтримуються #хештеги."
+        )
+        return MAIN
+
+    if text == BTN_CANCEL:
+        ctx.user_data.clear()
+        await update.message.reply_text("Скасовано.", reply_markup=main_kb())
+        return MAIN
+
+    # Якщо користувач одразу надіслав текст/голос/фото — вважай запитом додати нотатку (швидкий режим)
+    await update.message.reply_text("Обері дію з меню нижче.", reply_markup=main_kb())
     return MAIN
 
-# ---- ДОДАТИ КАТЕГОРІЮ ----
-async def add_cat_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message("Введи назву категорії:", reply_markup=MAIN_KB)
-    return ADD_CAT_WAIT_NAME
-
-async def add_cat_got_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- add category ---
+async def add_cat_got_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = (update.message.text or "").strip()
     if not name:
-        await update.message.reply_text("Порожня назва. Введи ще раз або натисни ❌ Скасувати.")
+        await update.message.reply_text("Порожня назва. Введи ще раз або натисни «Скасувати».")
         return ADD_CAT_WAIT_NAME
     try:
         page = ensure_category(name)
-        await update.message.reply_text(f"✅ Категорія: {name}", reply_markup=MAIN_KB)
-    except requests.HTTPError as e:
-        await update.message.reply_text(f"Помилка Notion: {e.response.text[:200]}")
+        title = page["properties"]["Name"]["title"][0]["plain_text"] if page["properties"]["Name"]["title"] else name
+        await update.message.reply_text(f"✅ Категорію «{title}» створено.", reply_markup=main_kb())
+    except Exception as e:
+        log.exception(e)
+        await update.message.reply_text("❌ Помилка створення категорії.", reply_markup=main_kb())
     return MAIN
 
-# ---- ДОДАТИ ПІДКАТЕГОРІЮ ----
-async def add_sub_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cats = list_categories()
-    if not cats:
-        await update.message.reply_text("Немає жодної категорії. Спочатку створіть категорію.", reply_markup=MAIN_KB)
+# --- add subcategory (pick cat) ---
+async def add_sub_pick_cat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if data == "BACK:MAIN":
+        await query.edit_message_text("Обері дію з меню нижче.")
+        await query.message.reply_text(" ", reply_markup=main_kb())
         return MAIN
-    kb = chunk_buttons(cats, "pick_cat")
-    await update.message.reply_text("Вибери категорію:", reply_markup=kb)
-    return ADD_SUB_CHOOSE_CAT
 
-async def add_sub_pick_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    if q.data == "back:main":
-        await q.edit_message_text("Повернув у меню."); 
-        await q.message.reply_text("Меню:", reply_markup=MAIN_KB); 
-        return MAIN
-    _, cat_id = q.data.split(":")
-    context.user_data["sub_parent_id"] = cat_id
-    await q.edit_message_text("Введи назву підкатегорії:")
+    if not data.startswith("CAT:"):
+        await query.answer("Невідомий вибір", show_alert=True)
+        return ADD_SUB_CHOOSE_CAT
+
+    cat_id = data.split(":", 1)[1]
+    ctx.user_data["addsub_cat"] = cat_id
+    await query.edit_message_text("Введи назву підкатегорії:")
     return ADD_SUB_WAIT_NAME
 
-async def add_sub_got_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_sub_got_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     name = (update.message.text or "").strip()
-    parent_id = context.user_data.get("sub_parent_id")
-    if not parent_id:
-        await update.message.reply_text("Помилка стану. Почни заново.", reply_markup=MAIN_KB)
+    cat_id = ctx.user_data.get("addsub_cat")
+    if not cat_id:
+        await update.message.reply_text("Втрачено вибір категорії. Спробуй ще раз.", reply_markup=main_kb())
         return MAIN
     if not name:
-        await update.message.reply_text("Порожня назва. Введи ще раз.")
+        await update.message.reply_text("Порожня назва. Введи ще раз або «Скасувати».")
         return ADD_SUB_WAIT_NAME
     try:
-        page = ensure_subcategory(name, parent_id)
-        await update.message.reply_text(f"✅ Підкатегорія: {name}", reply_markup=MAIN_KB)
-    except requests.HTTPError as e:
-        await update.message.reply_text(f"Помилка Notion: {e.response.text[:200]}")
-    finally:
-        context.user_data.pop("sub_parent_id", None)
+        page = ensure_subcategory(cat_id, name)
+        title = page["properties"]["Name"]["title"][0]["plain_text"] if page["properties"]["Name"]["title"] else name
+        await update.message.reply_text(f"✅ Підкатегорію «{title}» створено.", reply_markup=main_kb())
+    except Exception as e:
+        log.exception(e)
+        await update.message.reply_text("❌ Помилка створення підкатегорії.", reply_markup=main_kb())
     return MAIN
 
-# ---- СТВОРИТИ НОТАТКУ ----
-async def new_note_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cats = list_categories()
-    if not cats:
-        await update.message.reply_text("Немає категорій. Спочатку створіть категорію.", reply_markup=MAIN_KB)
+# --- new note (choose cat) ---
+async def new_note_pick_cat(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if data == "BACK:MAIN":
+        await query.edit_message_text("Обері дію з меню нижче.")
+        await query.message.reply_text(" ", reply_markup=main_kb())
         return MAIN
-    kb = chunk_buttons(cats, "nn_cat")
-    await update.message.reply_text("Вибери категорію для нотатки:", reply_markup=kb)
-    return NOTE_CHOOSE_CAT
 
-async def new_note_pick_cat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    if q.data == "back:main":
-        await q.edit_message_text("Повернув у меню.")
-        await q.message.reply_text("Меню:", reply_markup=MAIN_KB)
-        return MAIN
-    _, cat_id = q.data.split(":")
-    context.user_data["nn_cat_id"] = cat_id
+    if not data.startswith("CAT:"):
+        await query.answer("Невідомий вибір", show_alert=True)
+        return NOTE_CHOOSE_CAT
 
-    subs = list_subcategories(cat_id)
-    if not subs:
-        await q.edit_message_text("У цієї категорії немає підкатегорій. Спочатку створіть підкатегорію.")
-        await q.message.reply_text("Меню:", reply_markup=MAIN_KB)
-        return MAIN
-    kb = chunk_buttons(subs, "nn_sub")
-    await q.edit_message_text("Вибери підкатегорію:", reply_markup=kb)
-    return NOTE_CHOOSE_SUB
+    cat_id = data.split(":", 1)[1]
+    ctx.user_data["note_cat"] = cat_id
 
-async def new_note_pick_sub(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    if q.data == "back:main":
-        await q.edit_message_text("Повернув у меню.")
-        await q.message.reply_text("Меню:", reply_markup=MAIN_KB)
-        return MAIN
-    _, sub_id = q.data.split(":")
-    context.user_data["nn_sub_id"] = sub_id
-    await q.edit_message_text("Надішли текст нотатки. Хештеги додавай як #мітка.")
-    return NOTE_WAIT_TEXT
+    try:
+        subs = list_subcategories(cat_id)
+    except Exception as e:
+        log.exception(e)
+        subs = []
 
-async def new_note_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (update.message.text or "").strip()
-    if not text:
-        await update.message.reply_text("Порожній текст. Відправ ще раз.")
+    if subs:
+        await query.edit_message_text("Вибери підкатегорію (або повернись у меню):")
+        await query.message.reply_text(" ", reply_markup=ikb_subcategories(subs))
+        return NOTE_CHOOSE_SUB
+    else:
+        await query.edit_message_text("Надішли текст/голосове/фото для нотатки.")
         return NOTE_WAIT_TEXT
 
-    tags = parse_tags(text)
-    cat_id = context.user_data.get("nn_cat_id")
-    sub_id = context.user_data.get("nn_sub_id")
+# --- new note (choose sub) ---
+async def new_note_pick_sub(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data or ""
+    if data == "BACK:MAIN":
+        await query.edit_message_text("Обері дію з меню нижче.")
+        await query.message.reply_text(" ", reply_markup=main_kb())
+        return MAIN
 
-    # Формуємо короткий заголовок (перші слова без хештегів)
-    title = re.sub(r"#\S+", "", text).strip()
-    title = title.split("\n")[0][:80] or "Note"
+    if not data.startswith("SUB:"):
+        await query.answer("Невідомий вибір", show_alert=True)
+        return NOTE_CHOOSE_SUB
+
+    sub_id = data.split(":", 1)[1]
+    ctx.user_data["note_sub"] = sub_id
+    await query.edit_message_text("Надішли текст/голосове/фото для нотатки.")
+    return NOTE_WAIT_TEXT
+
+# --- new note (receive text/voice/photo) ---
+async def new_note_got_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    cat_id = ctx.user_data.get("note_cat")
+    sub_id = ctx.user_data.get("note_sub")
+    if not cat_id:
+        await update.message.reply_text("Втрачено вибір категорії. Спробуй знову.", reply_markup=main_kb())
+        return MAIN
+
+    text = update.message.text or update.message.caption or ""
+
+    # Голос -> текст (опціонально)
+    if update.message.voice and not text:
+        t = await transcribe_voice(update, ctx)
+        if t:
+            text = t
+
+    tags = parse_tags(text)
+    title = (text[:50] or "Нотатка").strip()
+
+    files = None  # можна додати завантаження фото в Notion (public url) — опустимо для стабільності
+    created = datetime.datetime.now()
+    link = src_link(update.message)
 
     try:
-        notion_create_note(title, text, tags, cat_id, sub_id, None)
-        await update.message.reply_text("💾 Збережено в Notion.", reply_markup=MAIN_KB)
-    except requests.HTTPError as e:
-        await update.message.reply_text(f"Помилка Notion: {e.response.text[:300]}", reply_markup=MAIN_KB)
-    finally:
-        context.user_data.pop("nn_cat_id", None)
-        context.user_data.pop("nn_sub_id", None)
+        notion_create_note(title, text, tags, cat_id, sub_id, files, created, link)
+        await update.message.reply_text("✅ Нотатку збережено.", reply_markup=main_kb())
+    except Exception as e:
+        log.exception(e)
+        await update.message.reply_text("❌ Помилка збереження нотатки.", reply_markup=main_kb())
+
+    ctx.user_data.pop("note_cat", None)
+    ctx.user_data.pop("note_sub", None)
     return MAIN
 
-# ---- ПОШУК ----
-async def search_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Введи ключове слово/фразу для пошуку по нотатках:", reply_markup=MAIN_KB)
-    return SEARCH_WAIT_QUERY
-
-async def search_got_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- search ---
+async def search_got_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = (update.message.text or "").strip()
     if not q:
-        await update.message.reply_text("Порожній запит. Введи ще раз або натисни ❌ Скасувати.")
+        await update.message.reply_text("Порожній запит. Введи слово або #тег.")
         return SEARCH_WAIT_QUERY
-    flt = {"property":"Text","rich_text":{"contains": q}}
-    try:
-        res = notion_query(NOTES_DB_ID, flt, page_size=10)
-        results = []
-        for r in res.get("results", []):
-            name_parts = r["properties"]["Name"]["title"]
-            title = name_parts[0]["plain_text"] if name_parts else "(без назви)"
-            results.append(f"• {title}")
-        if not results:
-            await update.message.reply_text("Нічого не знайдено.", reply_markup=MAIN_KB)
-        else:
-            await update.message.reply_text("Знайшов:\n" + "\n".join(results), reply_markup=MAIN_KB)
-    except requests.HTTPError as e:
-        await update.message.reply_text(f"Помилка Notion: {e.response.text[:200]}", reply_markup=MAIN_KB)
+    # TODO: додай власну реалізацію пошуку по Notes (query з фільтром title/rich_text/tags)
+    await update.message.reply_text(f"Шукаю: {q} … (додай тут свій пошук)", reply_markup=main_kb())
     return MAIN
 
-# ---- HELP ----
-async def help_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Що вмію:\n"
-        "• ➕ Категорія — створити категорію.\n"
-        "• ➕ Підкатегорія — вибрати категорію і задати підкатегорію.\n"
-        "• 📝 Нотатка — вибрати категорію/підкатегорію та надіслати текст (хештеги як #мітка).\n"
-        "• 🔎 Пошук — швидкий пошук по тексту нотаток.\n",
-        reply_markup=MAIN_KB
-    )
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data.clear()
+    if update.message:
+        await update.message.reply_text("Скасовано.", reply_markup=main_kb())
     return MAIN
 
-# ---- РОЗПІЗНАВАННЯ ВИБОРУ З МЕНЮ ----
-async def main_menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (update.message.text or "").strip()
-    if txt == BTN_ADD_CAT:
-        return await add_cat_entry(update, context)
-    if txt == BTN_ADD_SUB:
-        return await add_sub_entry(update, context)
-    if txt == BTN_NEW_NOTE:
-        return await new_note_entry(update, context)
-    if txt == BTN_SEARCH:
-        return await search_entry(update, context)
-    if txt == BTN_HELP:
-        return await help_msg(update, context)
-    if txt == BTN_CANCEL:
-        return await cancel(update, context)
-    # якщо прийшов довільний текст у головному стані — підкажемо про меню
-    await update.message.reply_text("Обери дію з меню нижче.", reply_markup=MAIN_KB)
-    return MAIN
-
-# -------------------- MAIN() --------------------
-def main():
+def build_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start), MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu_router)],
+        entry_points=[CommandHandler("start", start),
+                      MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu_router)],
         states={
             MAIN: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu_router),
@@ -382,19 +485,19 @@ def main():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_cat_got_name),
             ],
             ADD_SUB_CHOOSE_CAT: [
-                CallbackQueryHandler(add_sub_pick_cat, pattern=r"^(pick_cat|back:main):"),
+                CallbackQueryHandler(add_sub_pick_cat),
             ],
             ADD_SUB_WAIT_NAME: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_sub_got_name),
             ],
             NOTE_CHOOSE_CAT: [
-                CallbackQueryHandler(new_note_pick_cat, pattern=r"^(nn_cat|back:main):"),
+                CallbackQueryHandler(new_note_pick_cat),
             ],
             NOTE_CHOOSE_SUB: [
-                CallbackQueryHandler(new_note_pick_sub, pattern=r"^(nn_sub|back:main):"),
+                CallbackQueryHandler(new_note_pick_sub),
             ],
             NOTE_WAIT_TEXT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, new_note_got_text),
+                MessageHandler(filters.TEXT | filters.PHOTO | filters.VOICE, new_note_got_text),
             ],
             SEARCH_WAIT_QUERY: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, search_got_query),
@@ -402,20 +505,22 @@ def main():
         },
         fallbacks=[MessageHandler(filters.Regex(f"^{BTN_CANCEL}$"), cancel)],
         allow_reentry=True,
+        per_chat=True, per_user=True, per_message=False,
     )
-
     app.add_handler(conv)
+    return app
 
-    # --- вебхук для Railway ---
+def main():
+    app = build_app()
     if WEBHOOK_URL:
-        path = "/tg"
-        log.info("Starting webhook on %s", WEBHOOK_URL)
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=path,
-            webhook_url=f"{WEBHOOK_URL}{path}",
-        )
+        # дозволяє передавати https://xxx/wh_... або https://xxx/
+        from urllib.parse import urlparse
+        u = urlparse(WEBHOOK_URL)
+        base = f"{u.scheme}://{u.netloc}"
+        path = u.path if u.path and u.path != "/" else "/tg"
+        full = base + path
+        log.info("Starting webhook on %s", full)
+        app.run_webhook(listen="0.0.0.0", port=PORT, url_path=path, webhook_url=full)
     else:
         log.info("Starting polling")
         app.run_polling()
