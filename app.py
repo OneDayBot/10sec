@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# Telegram ↔ Notion бот з кнопками (без AIORateLimiter)
+# Telegram ↔ Notion бот з кнопками (тепер з підтримкою фото/документів у нотатках)
 
 from __future__ import annotations
 
@@ -148,7 +148,6 @@ def ensure_category(name: str) -> CatalogItem:
     return CatalogItem(id=p["id"], name=name, type="Category")
 
 def ensure_subcategory(name: str, parent: CatalogItem) -> CatalogItem:
-    # підбираємо серед підкатегорій цього parent по імені
     data = notion_query(CATALOG_DB_ID, {
         "filter": {"and": [
             {"property": "Type", "select": {"equals": "Subcategory"}},
@@ -177,6 +176,7 @@ def create_note(
     subcategory: Optional[CatalogItem] = None,
     tags: Optional[List[str]] = None,
     source: Optional[str] = None,
+    files: Optional[List[dict]] = None,       # <<<<< ДОДАНО
 ) -> str:
     title = (title or "").strip() or "Нотатка"
     created = datetime.datetime.now().isoformat()
@@ -194,6 +194,8 @@ def create_note(
         props["Tags"] = {"multi_select": [{"name": t[:50]} for t in tags[:10]]}
     if source:
         props["Source"] = {"url": source}
+    if files:
+        props["Files"] = {"files": files}     # <<<<< ДОДАНО
 
     p = notion_create_page({
         "parent": {"database_id": NOTES_DB_ID},
@@ -259,7 +261,7 @@ async def menu_router(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
             📘 Коротко:
             • «Категорія» — створює запис у Catalog з Type=Category.
             • «Підкатегорія» — обери категорію → введи назву підкатегорії.
-            • «Нотатка» — обери категорію/підкатегорію → надішли текст; створиться сторінка у Notes.
+            • «Нотатка» — обери категорію/підкатегорію → надішли текст/фото/документ; створиться сторінка у Notes.
             • «Пошук» — шукає нотатки у Notes (по заголовку та Text).
         """)
         await update.message.reply_text(help_text, reply_markup=kb_main())
@@ -359,23 +361,69 @@ async def note_choose_sub(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int
             )
             return NOTE_CHOOSE_SUB
     ctx.user_data["NOTE_SUB"] = sub
-    await update.message.reply_text("Надішли текст нотатки:", reply_markup=kb_back())
+    await update.message.reply_text("Надішли текст/фото/документ для нотатки (caption теж збережу):", reply_markup=kb_back())
     return NOTE_ENTER_TEXT
 
 async def note_enter_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
-    txt = (update.message.text or "").strip()
-    if txt == "⬅️ Назад у меню":
-        await update.message.reply_text("Повернув у меню.", reply_markup=kb_main())
-        return MENU
+    # Підтримуємо: текст, фото (з caption), документ (з caption)
     cat: CatalogItem = ctx.user_data.get("NOTE_CAT")
     sub: Optional[CatalogItem] = ctx.user_data.get("NOTE_SUB")
+
+    # 1) Текст беремо з message.text АБО caption
+    txt = (update.message.text or update.message.caption or "").strip()
+
+    # 2) Готуємо список файлів для Notion (external URLs)
+    files_payload: List[dict] = []
+
+    # Фото: беремо найбільше прев'ю
+    if update.message.photo:
+        try:
+            photo = update.message.photo[-1]  # найбільша
+            file = await ctx.bot.get_file(photo.file_id)
+            if getattr(file, "file_path", None):
+                url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+                files_payload.append({
+                    "name": "photo.jpg",
+                    "type": "external",
+                    "external": {"url": url}
+                })
+        except Exception as e:
+            log.exception("photo handling failed")
+
+    # Документ: будь-який файл
+    if update.message.document:
+        try:
+            doc = update.message.document
+            file = await ctx.bot.get_file(doc.file_id)
+            fname = doc.file_name or "file"
+            if getattr(file, "file_path", None):
+                url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file.file_path}"
+                files_payload.append({
+                    "name": fname,
+                    "type": "external",
+                    "external": {"url": url}
+                })
+        except Exception as e:
+            log.exception("document handling failed")
+
+    # 3) Заголовок
+    title = (txt.splitlines()[0] if txt else ("Фото" if files_payload else "Нотатка"))[:60]
+
     try:
-        title = (txt.splitlines()[0] if txt else "Нотатка")[:60]
-        create_note(title=title, text=txt, category=cat, subcategory=sub, tags=None, source=None)
-        await update.message.reply_text("✅ Нотатку створено.", reply_markup=kb_main())
+        create_note(
+            title=title,
+            text=txt,
+            category=cat,
+            subcategory=sub,
+            tags=None,
+            source=None,
+            files=files_payload if files_payload else None,
+        )
+        await update.message.reply_text("✅ Нотатку збережено.", reply_markup=kb_main())
     except Exception as e:
         log.exception("create_note failed")
-        await update.message.reply_text(f"Помилка створення нотатки: {e}", reply_markup=kb_main())
+        await update.message.reply_text(f"❌ Помилка створення нотатки: {e}", reply_markup=kb_main())
+
     return MENU
 
 # --- Пошук
@@ -431,7 +479,8 @@ def build_app():
             ADD_SUB_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_sub_name)],
             NOTE_CHOOSE_CAT: [MessageHandler(filters.TEXT & ~filters.COMMAND, note_choose_cat)],
             NOTE_CHOOSE_SUB: [MessageHandler(filters.TEXT & ~filters.COMMAND, note_choose_sub)],
-            NOTE_ENTER_TEXT: [MessageHandler(filters.TEXT & ~filters.COMMAND, note_enter_text)],
+            # ГОЛОВНЕ: приймаємо TEXT + PHOTO + DOCUMENT
+            NOTE_ENTER_TEXT: [MessageHandler((filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND, note_enter_text)],
             SEARCH_ENTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, search_enter)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
