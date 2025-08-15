@@ -1,4 +1,2 @@
 python-telegram-bot[webhooks]==20.7
-openai>=1.37.0
-httpx==0.25.2
-requests>=2.31
+requests>=2.31.0
